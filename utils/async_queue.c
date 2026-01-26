@@ -66,6 +66,26 @@ static inline void compute_abs_timeout(uint64_t timeout_ns, struct timespec *ts)
 	}
 }
 
+static inline __attribute__((always_inline, hot, nonnull))
+void async_queue_print(async_queue_t *q) {
+	pthread_mutex_lock(&q->head_lock);
+	pthread_mutex_lock(&q->tail_lock);
+
+	const size_t n = (size_t)atomic_load(&q->size);
+	const size_t cap = (size_t)q->capacity;
+	size_t idx = (size_t)q->head;
+	
+	for (size_t i = 0; i < n; ++i) {
+		void *item = q->items[idx];
+		printf(" [%zu] %p\n", i, item);
+		idx++;
+		if (idx == cap) idx = 0;
+	}
+
+	pthread_mutex_unlock(&q->tail_lock);
+	pthread_mutex_unlock(&q->head_lock);
+}
+
 /* Core functionality */
 static async_queue_t *async_queue_init(int size) {
 	if (size <= 0) return NULL;
@@ -278,7 +298,7 @@ int async_queue_batch_push(async_queue_t *q,
 		memcpy(&q->items[0], items + first_chunk, second_chunk * sizeof(void*));
 
 	q->tail = (q->tail + to_push) % q->capacity;
-	atomic_fetch_add(&q->size, 1);
+	atomic_fetch_add(&q->size, to_push);
 	*in_cnt = to_push;
 
 	pthread_cond_signal(&q->not_empty);
@@ -324,7 +344,7 @@ void **async_queue_batch_pop(async_queue_t *q,
 		memcpy(batch + first_chunk, &q->items[0], second_chunk * sizeof(void*));
 
 	q->head = (q->head + take) % q->capacity;
-	atomic_fetch_sub(&q->size, 1);
+	atomic_fetch_sub(&q->size, take);
 
 	pthread_cond_signal(&q->not_full);
 
@@ -335,6 +355,22 @@ void **async_queue_batch_pop(async_queue_t *q,
 }
 
 int main(void) {
+	async_queue_t *q = async_queue_init(10);
+	size_t pushed = 0;
+	char a = 'A', b = 'B', c = 'C', d = 'D', e = 'E';
+	const void *batch_in[] = { &a, &b, &c, &d, &e };
 
+	int rc = async_queue_batch_push(
+		q,
+		batch_in,
+		5, // batch size 
+		0, // non-block 
+		&pushed
+	);
+	
+	printf("pushed: %zu -- rc: %d\n", pushed, rc);
+	async_queue_print(q);
+	
+	async_queue_free(q);
 	return 0;
 }
