@@ -22,13 +22,14 @@ typedef struct {
 } async_queue_t;
 
 /* Core functioanlity */
-static async_queue_t *async_queue_init(int size);
-static void async_queue_free(async_queue_t *q);
-static int async_queue_push(async_queue_t *q, void *item);
-static void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns); // can pop with max timeout
+async_queue_t *async_queue_init(int size);
+void async_queue_free(async_queue_t *q);
+void async_queue_shutdown(async_queue_t *q); 
+int async_queue_push(async_queue_t *q, void *item);
+void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns); // can pop with max timeout
 /* Non-blocking variants */
-static int async_queue_try_push(async_queue_t *q, void *item);
-static void *async_queue_try_pop(async_queue_t *q);
+int async_queue_try_push(async_queue_t *q, void *item);
+void *async_queue_try_pop(async_queue_t *q);
 /* Batch (with Non-blocking option) variants */
 __attribute__((always_inline, hot, nonnull))
 int async_queue_batch_push(async_queue_t *q, 
