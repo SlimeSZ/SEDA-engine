@@ -3,10 +3,11 @@
 
 #include <pthread.h>
 #include <stdint.h>
-#include <cstdint>
 #include <stdatomic.h>
 #include "../../utils/async_queue.h"
 #include "../../utils/worker_pool.h"
+
+#define MAX_TASKS 448
 
 typedef enum {
 	TASK_REGISTERED = 0, 			// exists but not scheduled in heap 
@@ -120,7 +121,9 @@ typedef struct {
 */
 
 /* API */
-scheduler_t *scheduler_init(size_t max_tasks, async_queue_t *output_queue);
+scheduler_t *scheduler_init(worker_entry_fn_t entry_fn,
+		size_t initial_workers,
+		size_t max_tasks, async_queue_t *output_queue);
 void scheduler_shutdown(scheduler_t *s);
 
 int scheduler_run(scheduler_t *s);

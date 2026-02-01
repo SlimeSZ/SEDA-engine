@@ -15,7 +15,7 @@ static inline void free_internals(async_queue_t *q) {
 	free(q->items);
 	free(q);
 }
-static void async_queue_shutdown(async_queue_t *q) {
+void async_queue_shutdown(async_queue_t *q) {
     if (!q) return;
 
     atomic_store(&q->shutdown, 1);
@@ -87,7 +87,7 @@ void async_queue_print(async_queue_t *q) {
 }
 
 /* Core functionality */
-static async_queue_t *async_queue_init(int size) {
+async_queue_t *async_queue_init(int size) {
 	if (size <= 0) return NULL;
 
 	async_queue_t *q = malloc(sizeof(async_queue_t));
@@ -139,7 +139,7 @@ static async_queue_t *async_queue_init(int size) {
 	return q;
 }
 
-static void async_queue_free(async_queue_t *q) {
+void async_queue_free(async_queue_t *q) {
     if (!q) return;
     async_queue_shutdown(q);
     pthread_cond_destroy(&q->not_full);
@@ -154,7 +154,7 @@ static void async_queue_free(async_queue_t *q) {
  * 
  * returns 0 on successm -1 on queue shutdown or invalid parameters
  */
-static int async_queue_push(async_queue_t *q, void *item) {
+int async_queue_push(async_queue_t *q, void *item) {
 	if (!q || !item) return -1;
 	pthread_mutex_lock(&q->tail_lock);
 
@@ -182,7 +182,7 @@ static int async_queue_push(async_queue_t *q, void *item) {
  *
  * - returns (void) popped item on success, NULL on queue shutdown or invalid parameters
 */
-static void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns) {
+void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns) {
 	if (!q) return NULL;
 	pthread_mutex_lock(&q->head_lock);
 
@@ -217,7 +217,7 @@ static void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns) {
  *
  * returns 0 on success, -1 if queue full/empty, shutdown, or invalid parameters
 */
-static int async_queue_try_push(async_queue_t *q, void *item) {
+int async_queue_try_push(async_queue_t *q, void *item) {
 	if (!q || !item) return -1;
 	pthread_mutex_lock(&q->tail_lock);
 
@@ -232,7 +232,7 @@ static int async_queue_try_push(async_queue_t *q, void *item) {
 	pthread_mutex_unlock(&q->tail_lock);
 	return 0;
 }
-static void *async_queue_try_pop(async_queue_t *q) {
+void *async_queue_try_pop(async_queue_t *q) {
 	if (!q) return NULL;
 	pthread_mutex_lock(&q->head_lock);
 
