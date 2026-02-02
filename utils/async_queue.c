@@ -25,17 +25,17 @@ void async_queue_shutdown(async_queue_t *q) {
 }
 
 /* Inline Queue-state Utils */
-static inline __attribute__((always_inline))
+inline __attribute__((always_inline))
 int async_queue_empty(async_queue_t *q) {
     return atomic_load(&q->size) == 0;
 }
 
-static inline __attribute__((always_inline))
+inline __attribute__((always_inline))
 int async_queue_full(async_queue_t *q) {
     return atomic_load(&q->size) == q->capacity;
 }
 
-static inline __attribute__((always_inline)) 
+inline __attribute__((always_inline)) 
 int async_queue_is_shutdown(async_queue_t *q) {
 	return atomic_load(&q->shutdown);
 }

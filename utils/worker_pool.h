@@ -25,7 +25,7 @@ typedef struct {
 	_Atomic size_t num_working;
 
 	async_queue_t *ready_queue;		// borrowed from scheduler not owned 
-	worker_entry_fn_t entry_fn;		// all workers initially call this fn
+	worker_entry_fn_t entry_fn;		// all workers call this fn first upon task execution
 	worker_ctx_t ctx;			// all workers refer to the same context struct
 
 	_Atomic int shutdown;

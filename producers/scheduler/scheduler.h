@@ -9,42 +9,7 @@
 
 #define MAX_TASKS 448
 
-typedef enum {
-	TASK_REGISTERED = 0, 			// exists but not scheduled in heap 
-	TASK_SCHEDULED,				// heap entry waiting next execution at next_run_ns
-	TASK_RUNNING,				// actively executing, modifications must wait for state finish
-	TASK_CANCELLED, 	 		// may be in heap or running, in which case must pop or wait for execution 
-	TASK_ZOMBIE 				// finished and removed from scheduling, awaiting cleanup and memory reclamation
-} task_state_t;
-
-typedef enum {
-	TASK_MISS_SKIP = 0, 			// discard any missed executions, no backlog, predictable rate 
-	TASK_MISS_COALESCE,			// missed executions collapse into a single execution 
-	TASK_MISS_CATCHUP			// replay N missed executions N times consecutively
-} task_miss_policy_t;
-
-typedef struct {
-	void (*task_fn)(void *arg);	
-	void *arg;	
-	uint64_t interval_ns;
-
-	int completion_id;			// index into global completion bitmap 
-	
-	task_miss_policy_t miss_policy;
-	_Atomic task_state_t state;
-
-	_Atomic uint64_t last_run_ns;
-	_Atomic uint64_t actual_run_ns;
-	_Atomic uint64_t run_count;
-	_Atomic uint64_t missed_runs;
-} task_t;
-
-/* (what lives inside the heap) */
-typedef struct {
-	task_t *task; 
-	uint64_t next_run_ns;
-} scheduler_entry_t; 
-
+typedef struct task_t task_t;
 /* Control Plane Queue (allow run-time scheduler heap mutations) without race conditions */
 /* Action state requests for scheduler thread */
 typedef enum {
@@ -67,6 +32,48 @@ typedef struct {
 	task_t *task;
 	uint64_t new_interval_ns;
 } scheduler_ctrl_payload;
+
+typedef enum {
+	TASK_REGISTERED = 0, 			// exists but not scheduled in heap 
+	TASK_SCHEDULED,				// heap entry waiting next execution at next_run_ns
+	TASK_RUNNING,				// actively executing, modifications must wait for state finish
+	TASK_CANCELLED, 	 		// may be in heap or running, in which case must pop or wait for execution 
+	TASK_ZOMBIE 				// finished and removed from scheduling, awaiting cleanup and memory reclamation
+} task_state_t;
+
+typedef enum {
+	TASK_MISS_SKIP = 0, 			// discard any missed executions, no backlog, predictable rate 
+	TASK_MISS_COALESCE,			// missed executions collapse into a single execution 
+	TASK_MISS_CATCHUP			// replay N missed executions N times consecutively
+} task_miss_policy_t;
+
+typedef struct {
+	task_t *task;
+	void *result;
+} task_result_t;
+
+struct task_t {
+	void *(*task_fn)(void *arg);	
+	void *arg;	
+	uint64_t interval_ns;
+
+	int completion_id;			// index into global completion bitmap 
+	
+	task_miss_policy_t miss_policy;
+	_Atomic task_state_t state;
+
+	_Atomic uint64_t last_run_ns;
+	_Atomic uint64_t actual_run_ns;
+	_Atomic uint64_t run_count;
+	_Atomic uint64_t missed_runs;
+};
+
+
+/* (what lives inside the heap) */
+typedef struct {
+	task_t *task; 
+	uint64_t next_run_ns;
+} scheduler_entry_t; 
 
 typedef struct {
 	scheduler_entry_t *heap;		// min-heap for earliest task guarantee without extensive linear scan
@@ -121,13 +128,12 @@ typedef struct {
 */
 
 /* API */
-scheduler_t *scheduler_init(worker_entry_fn_t entry_fn,
-		size_t initial_workers,
+scheduler_t *scheduler_init(size_t initial_workers,
 		size_t max_tasks, async_queue_t *output_queue);
 void scheduler_shutdown(scheduler_t *s);
-
 int scheduler_run(scheduler_t *s);
 
+// todo: impl these
 int scheduler_add_task(scheduler_t *s, task_t *task);
 int scheduler_rm_task(scheduler_t *s, task_t *task);
 int scheduler_pause_task(scheduler_t *s, task_t *task);

@@ -6,12 +6,17 @@
 #define MAX_TASKS 448
 #define MAX_TASKS_PER_WORKER 32 
 
+/*
+ * Make design option to possibly only wake if batch available (use batch_pop),
+ * do something with try_pop?
+*/
 static void *worker_thread_routine(void *arg) {
 	worker_pool_t *pool = (worker_pool_t *)arg;
 
 	while (!atomic_load(&pool->shutdown)) {
+		// block until scheduler dispatches a task into the "ready-to-exec-queue" 
 		ready_entry_t *entry = async_queue_pop(pool->ready_queue, NULL);
-		if (!entry) continue;
+		if (!entry || async_queue_is_shutdown(pool->ready_queue)) continue;
 
 		atomic_fetch_sub(&pool->num_free, 1);
 		atomic_fetch_add(&pool->num_working, 1);
@@ -68,8 +73,6 @@ void worker_pool_shutdown(worker_pool_t *pool) {
 	if (!pool) return;
 
 	atomic_store(&pool->shutdown, 1);
-
-	async_queue_shutdown(pool->ready_queue);
 
 	for (size_t i = 0; i < pool->size; i++) 
 		pthread_join(pool->workers[i], NULL);

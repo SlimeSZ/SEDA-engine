@@ -43,9 +43,9 @@ void **async_queue_batch_pop(async_queue_t *q,
                             const int8_t non_block,
                             size_t *__restrict__ out_cnt);
 /* State Checks */
-static inline __attribute__((always_inline)) int async_queue_empty(async_queue_t *q);
-static inline __attribute__((always_inline)) int async_queue_full(async_queue_t *q);
-static inline __attribute__((always_inline)) int async_queue_is_shutdown(async_queue_t *q);
+int async_queue_empty(async_queue_t *q);
+int async_queue_full(async_queue_t *q);
+int async_queue_is_shutdown(async_queue_t *q);
 
 /*		TODO;
 Priority awareness – allow items to carry a priority hint so consumers can pop urgent tasks first
