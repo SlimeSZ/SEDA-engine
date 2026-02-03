@@ -16,7 +16,7 @@
 #include <stdio.h>
 
 /* Utilities */
-static inline __attribute__((always_inline, hot))
+inline __attribute__((always_inline, hot))
 uint64_t get_monotonic_ns(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -25,56 +25,14 @@ uint64_t get_monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static void handle_shutdown(scheduler_t *s) {
-	/* Set scheduler shutdown flag */
-	atomic_store(&s->shutdown, 1);
-
-	/* Drain worker pool, preventing new executions and waiting for current to stop,
-	   before draining ready queue */
-	ready_entry_t *pending_task;
-	while ((pending_task = async_queue_try_pop(s->ready_queue)) != NULL) {
-		if (pending_task->task) 
-			atomic_store(&((task_t*)pending_task)->state, TASK_CANCELLED);
-		free(pending_task);
-	}
-	while (atomic_load(&s->pool->num_working) > 0)
-		sched_yield();
-	worker_pool_shutdown(s->pool);
-	async_queue_shutdown(s->ready_queue);
-	async_queue_free(s->ready_queue);
-
-	/* Drain cntrl queue */
-	scheduler_ctrl_payload *ctrl_pending;
-	while ((ctrl_pending = async_queue_try_pop(s->ctrl_queue)) != NULL) 
-		free(ctrl_pending);
-	async_queue_shutdown(s->ctrl_queue);
-	async_queue_free(s->ctrl_queue);
-
-	// user-owned s->output_queue, no free() here
-
-	/* Cleanup task-heap */
-	for (size_t i = 0; i < s->size; i++) {
-		task_t *task = s->heap[i].task; // user-owned task, no free() here
-		if (!task) continue;
-		
-		task_state_t t_state = atomic_load(&task->state);
-		if (t_state == TASK_SCHEDULED)
-			atomic_store(&task->state, TASK_CANCELLED);
-	}
-	free(s->heap);
-
-	/* Close all fds */
-	epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->timer_fd, NULL);
-	epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->ctrl_eventfd, NULL);
-	epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->completion_eventfd, NULL);
-	close(s->timer_fd);
-	close(s->ctrl_eventfd);
-	close(s->completion_eventfd);
-	close(s->epoll_fd);
-
-	free(s);
-}
-
+/* Scheduler state-change request - Responsible for scheduler-state changes (task add, 
+ * 								  sched shutdown, ...)
+ * - user-defined code or API write to scheduler's control event fd after pushing 
+ * 	specified state change to control queue 
+ * - scheduler_run fn's epoll_wait is woken, prompting it to call this fn 
+ * - specified state change is popped from the queue and executed 
+ *  		(functions defined in scheduler_control_plane.c)
+*/
 static void handle_ctrl_request(scheduler_t *s) {
 	uint64_t x;
 	read(s->ctrl_eventfd, &x, sizeof(x));
@@ -83,28 +41,46 @@ static void handle_ctrl_request(scheduler_t *s) {
 	while ((payload = async_queue_try_pop(s->ctrl_queue)) != NULL) {
 		switch (payload->op) {
 			case SCHED_ADD:
-				return;
+				sched_add_task(s, payload->task);
+				break;
 			case SCHED_REMOVE:
-				return;
+				sched_rm_task(s, payload->task);
+				break;
 			case SCHED_PAUSE:
-				return;
+				sched_pause_task(s, payload->task);
+				break;
 			case SCHED_RESUME:
-				return;
+				sched_resume_task(s, payload->task);
+				break;
 			case SCHED_RESCHEDULE:
-				return;
+				sched_resched_task(s, payload->task);
+				break;
 			case SCHED_SHUTDOWN:
-				handle_shutdown(s);
+				sched_shutdown(s);
 				break;
 		}
 		free(payload);
 	}
 }
 
+/* Task timer expiration handler - responsible for pushing "ready tasks" to ready_queue for exec.
+ *    Task timerfd wakes epoll_wait -> push task to 
+ *    ready_queue (view worker_entry_fn C doc) -> rearm timerfd for next deadline
+ *
+ * - scheduler_run fn's epoll_wait is woken by timerfd expiration(s)
+ * - N timerfd expirations signal N ready tasks whose metadata is prepped
+ *   before loading them into the ready_queue
+ * - worker pool receives these tasks via the queue & promptly executes
+ * - rearming min heap deadline ensures all tasks execute when they need to 
+ *
+*/
 static void handle_timerfd_wake(scheduler_t *s) {
 	uint64_t expirations;
 	read(s->timer_fd, &expirations, sizeof(expirations));
 
 	uint64_t now = get_monotonic_ns();
+	// why not utilize int n = read... n expirations to ensure exact no. tasks that need 
+	// to execute, execute?
 	while (s->size > 0 && s->heap[0].next_run_ns <= now) { 
 		// pop scheduled-entry from heap
 		scheduler_entry_t entry = heap_pop(s); 
@@ -141,19 +117,29 @@ static void handle_timerfd_wake(scheduler_t *s) {
 	// then completionfd below (signaled by worker)
 }
 
-static void handle_completionfd_wake(scheduler_t *s) {
-	/*
-	 * As of right now this doesnt need to do anything,
-	 * timerfd wake triggers worker_entry_fn -> executes task -> pushes to output queue 
-	 * if we move output queue push here it'd be unncessary syntatical overhead + awkward 
-	 * to re-obtain the exact task from the heap, potentially even impact performance
-	 * Might remove any 'completion' related functionality entirely
-	*/
-	
-}
+/*
+* As of right now this doesnt need to do anything,
+* timerfd wake triggers worker_entry_fn -> executes task -> pushes to output queue 
+* if we move output queue push here it'd be unncessary syntatical overhead + awkward 
+* to re-obtain the exact task from the heap, potentially even impact performance
+* Might remove any 'completion' related functionality entirely
+*/
+static void handle_completionfd_wake(scheduler_t *s) {}
 
 /*
+ * Pre-defined worker_entry_fn: Execute a task_t obtained via scheduler's ready-queue push 
+ * from upon timer-fd wake
+ *    scheduler's timer-fd wake -> pushes task to ready-queue -> worker routine 
+ *    obtains task -> worker routine executes this entry fn
  * 
+ * - computes task_t time-related metadata 
+ * - executes task, storing & directly pushing result to scheduler's 
+ *   output queue via the worker context, applications wake upon receiving 
+ *   said result 
+ * - ensures task-state integrity all throughout the process 
+ * - updates scheduler's task-completion related metadata 
+ * - wakes optional completion event for further processing, although as of right now there 
+ *   is no way for this thread to receive the task-result
 */
 static void worker_entry_fn(ready_entry_t *entry, void *ctx_void) {
 	if (!entry || !ctx_void) return;
@@ -216,7 +202,6 @@ static void worker_entry_fn(ready_entry_t *entry, void *ctx_void) {
 	free(entry);
 } 
 
-/* Core API */
 scheduler_t *scheduler_init(
 	size_t initial_workers, 
 	size_t max_tasks, 
@@ -271,7 +256,7 @@ scheduler_t *scheduler_init(
 	if (!s->ready_queue)
 		goto fail_ready_queue;
 	
-	s->pool = worker_pool_init(initial_workers, s->ready_queue, worker_entry_fn, ctx);
+	s->pool = worker_pool_init(initial_workers, s->ready_queue, &worker_entry_fn, ctx);
 	if (!s->pool)
 		goto fail_worker_pool;
 

@@ -132,19 +132,24 @@ scheduler_t *scheduler_init(size_t initial_workers,
 		size_t max_tasks, async_queue_t *output_queue);
 void scheduler_shutdown(scheduler_t *s);
 int scheduler_run(scheduler_t *s);
-
-// todo: impl these
-int scheduler_add_task(scheduler_t *s, task_t *task);
-int scheduler_rm_task(scheduler_t *s, task_t *task);
-int scheduler_pause_task(scheduler_t *s, task_t *task);
-int scheduler_resume_task(scheduler_t *s, task_t *task);
-int scheduler_reschedule_task(scheduler_t *s, task_t *task);
-
+/* scheduler state-change control-plane utils */
+void sched_shutdown(scheduler_t *s);
+int sched_add_task(scheduler_t *s, task_t *task);
+int sched_rm_task(scheduler_t *s, task_t *task);
+int sched_pause_task(scheduler_t *s, task_t *task);
+int sched_resume_task(scheduler_t *s, task_t *task);
+int sched_resched_task(scheduler_t *s, task_t *task);
 void scheduler_reset(scheduler_t *s);
-
-// insights + debugging
+/* insights + debugging */
 uint64_t scheduler_next_run(const scheduler_t *s);
 void scheduler_wake(scheduler_t *s);
 void scheduler_view_completed(scheduler_t *s);
+/* utilities */
+uint64_t get_monotonic_ns(void);
 
 #endif
+
+/*	TODO:
+ * make use of completion metadata/queue or cut it completely
+ * 
+*/
