@@ -22,7 +22,7 @@ typedef struct {
 } async_queue_t;
 
 /* Core functioanlity */
-async_queue_t *async_queue_init(int size);
+async_queue_t *async_queue_init(int size, int capacity);
 void async_queue_free(async_queue_t *q);
 void async_queue_shutdown(async_queue_t *q); 
 int async_queue_push(async_queue_t *q, void *item);

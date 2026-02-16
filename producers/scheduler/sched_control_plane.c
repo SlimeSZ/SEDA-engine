@@ -18,19 +18,36 @@
 
 void sched_shutdown(scheduler_t *s) {
 	/* Set scheduler shutdown flag */
-	atomic_store(&s->shutdown, 1);
+	atomic_store(&s->shutdown, 1); // MOVE TO SCHED.C SWITCH CASE
 
-	/* Drain worker pool, preventing new executions and waiting for current to stop,
-	   before draining ready queue */
+	/* Disarm timerfd immediately to prevent spurious wakeups */
+	struct itimerspec its = {0};
+	timerfd_settime(s->timer_fd, 0, &its, NULL);
+
+	/* Instantly mark heap tasks as cancelled before workers grab them */
+	for (size_t i = 0; i < s->size; i++) {
+		task_t *task = s->heap[i].task;
+		if (task) {
+			task_state_t state = atomic_load(&task->state);
+			if (state == TASK_SCHEDULED)
+				atomic_store(&task->state, TASK_CANCELLED);
+		}
+	}
+
+	/* join all worker threads, ensuring they finish, shutting down worker pool */
+	worker_pool_shutdown(s->pool);
+
+
+	/* Drain ready queue once all workers are shutdown & tasks have 100% all been executed */
 	ready_entry_t *pending_task;
 	while ((pending_task = async_queue_try_pop(s->ready_queue)) != NULL) {
-		if (pending_task->task) 
-			atomic_store(&((task_t*)pending_task)->state, TASK_CANCELLED);
+		if (pending_task->task) {
+			task_t *task = pending_task->task;
+			atomic_store(&task->state, TASK_CANCELLED);
+		} 
 		free(pending_task);
 	}
-	while (atomic_load(&s->pool->num_working) > 0)
-		sched_yield();
-	worker_pool_shutdown(s->pool);
+
 	async_queue_shutdown(s->ready_queue);
 	async_queue_free(s->ready_queue);
 
@@ -41,17 +58,8 @@ void sched_shutdown(scheduler_t *s) {
 	async_queue_shutdown(s->ctrl_queue);
 	async_queue_free(s->ctrl_queue);
 
-	// user-owned s->output_queue, no free() here
+	// user-owned s->output_queue, no queue_free(s->output_queue) here
 
-	/* Cleanup task-heap */
-	for (size_t i = 0; i < s->size; i++) {
-		task_t *task = s->heap[i].task; // user-owned task, no free() here
-		if (!task) continue;
-		
-		task_state_t t_state = atomic_load(&task->state);
-		if (t_state == TASK_SCHEDULED)
-			atomic_store(&task->state, TASK_CANCELLED);
-	}
 	free(s->heap);
 
 	/* Close all fds */
@@ -71,31 +79,25 @@ int sched_add_task(scheduler_t *s, task_t *task) {
 		return -1;
 
 	task_state_t curr_state = atomic_load(&task->state);
-	// won't this be ... || state == task_cancelled? (for cancelled we dont call this fn or do we?)
-	if (curr_state != TASK_REGISTERED && curr_state != TASK_CANCELLED)
+	if (curr_state != TASK_REGISTERED)
+		return -1;
+
+	if (s->size >= s->capacity)
 		return -1;
 		
 	// init new scheduler task-entry
-	scheduler_entry_t *sched_task = malloc(sizeof(scheduler_entry_t));
-	if (!sched_task)
-		return -1;
-	uint64_t now = get_monotonic_ns();
-	uint64_t next_run_ns = now + task->interval_ns;
-	sched_task->task = task;
-	sched_task->next_run_ns = next_run_ns;
-
-	if (s->size >= s->capacity) {
-		free(sched_task);
-		return -1;
-	}
+	scheduler_entry_t entry;
+	entry.task = task;
+	entry.next_run_ns = get_monotonic_ns() + task->interval_ns;
+	entry.task = task;
+	entry.next_run_ns = get_monotonic_ns() + task->interval_ns;
 
 	uint64_t old_min_deadline = (s->size > 0) ? s->heap[0].next_run_ns : UINT64_MAX;
 
 	// push to heap (not thread safe for now but only this adds to heap, so fine for now)
-	if (heap_push(s, sched_task) != 0) {
-		free(sched_task);
+	if (heap_push(s, &entry) != 0) 
 		return -1;
-	}
+	
 
 	atomic_store(&task->state, TASK_SCHEDULED);
 
@@ -109,7 +111,6 @@ int sched_add_task(scheduler_t *s, task_t *task) {
 			return -1;
 	}
 
-	free(sched_task);
 	return 0;
 }
 
@@ -117,7 +118,7 @@ int scheduler_rm_task(scheduler_t *s, task_t *task) {
 	if (!s || !task) return -1;
 
 	// task must NOT be running or either cancelled or zombie
-	task_state_t curr_state = task->state;
+	task_state_t curr_state = atomic_load(&task->state);
 	switch (curr_state) {
 		case TASK_RUNNING:
 			// can't pop while executing, worker will see state-change 
@@ -139,7 +140,8 @@ int scheduler_rm_task(scheduler_t *s, task_t *task) {
 	size_t task_idx = SIZE_MAX;
 	for (size_t i = 0; i < s->size; i++) {
 		if (s->heap[i].task == task) {
-			task_idx = i; break;
+			task_idx = i; 
+			break;
 		}
 	}
 	if (task_idx == SIZE_MAX) {
@@ -149,12 +151,15 @@ int scheduler_rm_task(scheduler_t *s, task_t *task) {
 
 	bool was_earliest_task = (task_idx == 0);
 
+	if (task_idx != s->size - 1) {
+		s->heap[task_idx] = s->heap[s->size - 1];
+	}
 	s->size--;
-	if (s->heap[task_idx].task != s->heap[s->size].task) {
-		s->heap[task_idx] = s->heap[s->size];
+	if (task_idx < s->size) {
 		heapify_down(s, task_idx);
 		heapify_up(s, task_idx);
 	}
+
 	atomic_store(&task->state, TASK_CANCELLED);
 
 	if (was_earliest_task && s->size > 0) {
@@ -170,8 +175,6 @@ int scheduler_rm_task(scheduler_t *s, task_t *task) {
 
 	return 0;
 }
-
-
 
 
 int scheduler_pause_task(scheduler_t *s, task_t *task);

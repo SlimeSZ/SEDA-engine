@@ -1,6 +1,9 @@
 #ifndef WORKER_POOL_H
 #define WORKER_POOL_H
 
+#define MAX_TASKS 448
+#define MAX_TASKS_PER_WORKER 32 
+
 #include <pthread.h>
 #include "async_queue.h"
 

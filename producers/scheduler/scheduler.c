@@ -56,6 +56,7 @@ static void handle_ctrl_request(scheduler_t *s) {
 				sched_resched_task(s, payload->task);
 				break;
 			case SCHED_SHUTDOWN:
+				atomic_store(&s->shutdown, 1);
 				sched_shutdown(s);
 				break;
 		}
@@ -113,7 +114,6 @@ static void handle_timerfd_wake(scheduler_t *s) {
 		its.it_value.tv_nsec = nxt % 1000000000ULL;
 		timerfd_settime(s->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 	}
-	// next impl worker_entry_fn 
 	// then completionfd below (signaled by worker)
 }
 
@@ -128,7 +128,7 @@ static void handle_completionfd_wake(scheduler_t *s) {}
 
 /*
  * Pre-defined worker_entry_fn: Execute a task_t obtained via scheduler's ready-queue push 
- * from upon timer-fd wake
+ * upon timer-fd wake
  *    scheduler's timer-fd wake -> pushes task to ready-queue -> worker routine 
  *    obtains task -> worker routine executes this entry fn
  * 
@@ -233,7 +233,7 @@ scheduler_t *scheduler_init(
 	if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->timer_fd, &ev) < 0) 
 		goto fail_timer_epoll;
 
-	s->ctrl_queue = async_queue_init(64);
+	s->ctrl_queue = async_queue_init(64, 100);
 	if (!s->ctrl_queue)
 		goto fail_ctrl_queue;
 	s->ctrl_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -252,7 +252,7 @@ scheduler_t *scheduler_init(
 		.output_queue = s->output_queue
 	};
 
-	s->ready_queue = async_queue_init(200);
+	s->ready_queue = async_queue_init(200, MAX_TASKS);
 	if (!s->ready_queue)
 		goto fail_ready_queue;
 	
@@ -298,6 +298,7 @@ void scheduler_shutdown(scheduler_t *s) {
 	state_req->task = NULL;
 	state_req->new_interval_ns = 0;
 
+	// ENSURE GRACEFUL 
 	async_queue_push(s->ctrl_queue, state_req);
 		
 	uint64_t x = 1;

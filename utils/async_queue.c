@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <errno.h>
+#include "worker_pool.h"
 
 /* Init/Free Utils */
 static inline void free_internals(async_queue_t *q) {
@@ -18,7 +19,7 @@ static inline void free_internals(async_queue_t *q) {
 void async_queue_shutdown(async_queue_t *q) {
     if (!q) return;
 
-    atomic_store(&q->shutdown, 1);
+    atomic_store_explicit(&q->shutdown, 1, memory_order_release);
 
     pthread_cond_broadcast(&q->not_full);
     pthread_cond_broadcast(&q->not_empty);
@@ -87,8 +88,8 @@ void async_queue_print(async_queue_t *q) {
 }
 
 /* Core functionality */
-async_queue_t *async_queue_init(int size) {
-	if (size <= 0) return NULL;
+async_queue_t *async_queue_init(int size, int capacity) {
+	if (size <= 0 || capacity > MAX_TASKS) return NULL;
 
 	async_queue_t *q = malloc(sizeof(async_queue_t));
 	if (!q) return NULL;
@@ -100,7 +101,7 @@ async_queue_t *async_queue_init(int size) {
 	}
 	memset(q->items, 0, sizeof(void*) * size);
 	
-	q->capacity = size;
+	q->capacity = capacity;
 	q->tail = 0;
 	q->head = 0;
 	atomic_init(&q->size, 0);
@@ -128,20 +129,23 @@ async_queue_t *async_queue_init(int size) {
 		free_internals(q);
 		return NULL;
 	}
-	if (pthread_cond_init(&q->not_empty, &cond_attr) != 0 ||
-	   pthread_cond_init(&q->not_full, &cond_attr) != 0) {
+	if (pthread_cond_init(&q->not_empty, &cond_attr) != 0) {
+		pthread_condattr_destroy(&cond_attr);
+		free_internals(q);
+		return NULL;	
+	}
+	if (pthread_cond_init(&q->not_full, &cond_attr) != 0) {
+		pthread_cond_destroy(&q->not_empty); // REFACTOR
 		pthread_condattr_destroy(&cond_attr);
 		free_internals(q);
 		return NULL;
+
 	}
-	
 	pthread_condattr_destroy(&cond_attr);
 	return q;
 }
 
 void async_queue_free(async_queue_t *q) {
-    if (!q) return;
-    async_queue_shutdown(q);
     pthread_cond_destroy(&q->not_full);
     pthread_cond_destroy(&q->not_empty);
     free_internals(q);
@@ -284,7 +288,7 @@ int async_queue_batch_push(async_queue_t *q,
 	const size_t available = q->capacity - atomic_load(&q->size);
 	if (available == 0) {
 		pthread_mutex_unlock(&q->tail_lock);
-		return 0;
+		return -1;
 	}
 
 	const size_t to_push = (available < n) ? available : n;
@@ -355,7 +359,7 @@ void **async_queue_batch_pop(async_queue_t *q,
 }
 
 int main(void) {
-	async_queue_t *q = async_queue_init(10);
+	async_queue_t *q = async_queue_init(10, 10);
 	size_t pushed = 0;
 	char a = 'A', b = 'B', c = 'C', d = 'D', e = 'E';
 	const void *batch_in[] = { &a, &b, &c, &d, &e };

@@ -3,9 +3,6 @@
 #include <stddef.h>
 #include <stdatomic.h>
 
-#define MAX_TASKS 448
-#define MAX_TASKS_PER_WORKER 32 
-
 /*
  * Make design option to possibly only wake if batch available (use batch_pop),
  * do something with try_pop?
