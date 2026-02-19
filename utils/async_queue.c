@@ -1,54 +1,32 @@
-#include "async_queue.h"
 #include <bits/time.h>
-#include <pthread.h>
-#include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
-#include <errno.h>
-#include "worker_pool.h"
+#include "async_queue.h"
+#include <unistd.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdint.h>
 
-/* Init/Free Utils */
+#define MAX_TASKS 400
+
 static inline void free_internals(async_queue_t *q) {
 	pthread_mutex_destroy(&q->tail_lock);
 	pthread_mutex_destroy(&q->head_lock);
 	free(q->items);
 	free(q);
 }
-void async_queue_shutdown(async_queue_t *q) {
-    if (!q) return;
 
-    atomic_store_explicit(&q->shutdown, 1, memory_order_release);
-
-    pthread_cond_broadcast(&q->not_full);
-    pthread_cond_broadcast(&q->not_empty);
-}
-
-/* Inline Queue-state Utils */
-inline __attribute__((always_inline))
-int async_queue_empty(async_queue_t *q) {
-    return atomic_load(&q->size) == 0;
-}
-
-inline __attribute__((always_inline))
-int async_queue_full(async_queue_t *q) {
-    return atomic_load(&q->size) == q->capacity;
-}
-
-inline __attribute__((always_inline)) 
-int async_queue_is_shutdown(async_queue_t *q) {
-	return atomic_load(&q->shutdown);
-}
-
-static inline __attribute__((always_inline))
+static inline __attribute__((always_inline, nonnull))
 void push(async_queue_t *q, void *item) {
 	q->items[q->tail] = item;
 	q->tail = (q->tail + 1) % q->capacity;
 	atomic_fetch_add(&q->size, 1);
 }
 
-static inline __attribute__((always_inline))
+static inline __attribute__((always_inline, nonnull))
 void *pop(async_queue_t *q) {
 	void *item = q->items[q->head];
 	q->head = (q->head + 1) % q->capacity;
@@ -56,7 +34,8 @@ void *pop(async_queue_t *q) {
 	return item;
 }
 
-static inline void compute_abs_timeout(uint64_t timeout_ns, struct timespec *ts) {
+static inline __attribute__((always_inline)) 
+void compute_abs_timeout(uint64_t timeout_ns, struct timespec *ts) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	ts->tv_sec = now.tv_sec + (timeout_ns / 1000000000ULL);
@@ -87,23 +66,39 @@ void async_queue_print(async_queue_t *q) {
 	pthread_mutex_unlock(&q->head_lock);
 }
 
-/* Core functionality */
-async_queue_t *async_queue_init(int size, int capacity) {
-	if (size <= 0 || capacity > MAX_TASKS) return NULL;
+/* USER API  */
 
+inline __attribute__((always_inline, nonnull))
+int async_queue_empty(async_queue_t *q) {
+	return atomic_load(&q->size) == 0;
+}
+
+inline __attribute__((always_inline, nonnull))
+int async_queue_full(async_queue_t *q) {
+	return atomic_load(&q->size) == q->capacity;
+}
+
+inline __attribute__((always_inline, nonnull))
+int async_queue_is_shutdown(async_queue_t *q) {
+	return atomic_load(&q->shutdown);
+}
+
+async_queue_t *async_queue_init(int capacity) {
+	if (capacity <= 0 || capacity >= MAX_TASKS)
+		return NULL;
+	
 	async_queue_t *q = malloc(sizeof(async_queue_t));
-	if (!q) return NULL;
-
-	q->items = malloc(sizeof(void*) * size);
+	if (!q) 
+		return NULL;
+	q->items = calloc(capacity, sizeof(void*));
 	if (!q->items) {
 		free(q);
 		return NULL;
 	}
-	memset(q->items, 0, sizeof(void*) * size);
 	
 	q->capacity = capacity;
-	q->tail = 0;
 	q->head = 0;
+	q->tail = 0;
 	atomic_init(&q->size, 0);
 	atomic_init(&q->shutdown, 0);
 
@@ -135,7 +130,7 @@ async_queue_t *async_queue_init(int size, int capacity) {
 		return NULL;	
 	}
 	if (pthread_cond_init(&q->not_full, &cond_attr) != 0) {
-		pthread_cond_destroy(&q->not_empty); // REFACTOR
+		pthread_cond_destroy(&q->not_empty);
 		pthread_condattr_destroy(&cond_attr);
 		free_internals(q);
 		return NULL;
@@ -146,183 +141,203 @@ async_queue_t *async_queue_init(int size, int capacity) {
 }
 
 void async_queue_free(async_queue_t *q) {
-    pthread_cond_destroy(&q->not_full);
-    pthread_cond_destroy(&q->not_empty);
-    free_internals(q);
+	pthread_cond_destroy(&q->not_empty);
+	pthread_cond_destroy(&q->not_full);
+	free_internals(q);
 }
 
-/*
- * - Blocks while queue is full, realeasing producer push lock (tail_lock); 
- * consumers must signal via 'not_full' upon pop() to wake producer
- * - Signals 'not_empty' upon push to wake any consumers 
- * 
- * returns 0 on successm -1 on queue shutdown or invalid parameters
- */
+void async_queue_shutdown(async_queue_t *q) {
+	if (!q) 
+		return;
+	atomic_store_explicit(&q->shutdown, 1, memory_order_release);
+	
+	pthread_cond_broadcast(&q->not_full);
+	pthread_cond_broadcast(&q->not_empty);
+}
+
 int async_queue_push(async_queue_t *q, void *item) {
-	if (!q || !item) return -1;
-	pthread_mutex_lock(&q->tail_lock);
-
-	while (async_queue_full(q) && !async_queue_is_shutdown(q))
-		pthread_cond_wait(&q->not_full, &q->tail_lock);
-
-	if (async_queue_is_shutdown(q)) {
-		pthread_mutex_unlock(&q->tail_lock);
+	if (!q || !item)
 		return -1;
+	pthread_mutex_lock(&q->tail_lock);
+	while (async_queue_full(q) && !async_queue_is_shutdown(q)) {
+		printf("[push()] queue full... waiting for pop()\n");
+		pthread_cond_wait(&q->not_full, &q->tail_lock);
 	}
-
+	printf(
+		"[push()] awaken, queue has space\n"
+	);
 	push(q, item);
+	
+	int now_sz = atomic_load(&q->size);
+	printf("[push()] PUSHED! - queue size now: %d\n", now_sz);
+
 	pthread_cond_signal(&q->not_empty);
 
 	pthread_mutex_unlock(&q->tail_lock);
 	return 0;
 }
 
-/*
- * - Null 'timeout_ns' param causes indefinite block while queue empty, releasing consumer pop lock (head_lock) 
- *   upon doing so, producer must signal consumer to pop() via 'not_empty' cond upon a push(). 
- * - Signals 'not_full' upon pop to indicate to any producers it is ready for more items 
- *
- * - Otherwise NonNull 'timeout_ns' param blocks for specified timeout 
- *
- * - returns (void) popped item on success, NULL on queue shutdown or invalid parameters
-*/
-void *async_queue_pop(async_queue_t *q, uint64_t *timeout_ns) {
-	if (!q) return NULL;
+void *async_queue_pop(async_queue_t *q) {
+	if (!q) 
+		return NULL;
 	pthread_mutex_lock(&q->head_lock);
-
 	while (async_queue_empty(q) && !async_queue_is_shutdown(q)) {
-		if (timeout_ns != NULL) {
-			struct timespec abs_timeout;
-			compute_abs_timeout(*timeout_ns, &abs_timeout);
-			int rc = pthread_cond_timedwait(&q->not_empty, &q->head_lock, &abs_timeout);
-			if (rc == ETIMEDOUT) {
-				pthread_mutex_unlock(&q->head_lock);
-				return NULL;
-			}
-		} else {
-			pthread_cond_wait(&q->not_empty, &q->head_lock);
-		}
+		printf("[pop()] queue empty... waiting for push()\n");
+		pthread_cond_wait(&q->not_empty, &q->head_lock);
+	}
+	if (async_queue_is_shutdown(q)) {
+		pthread_mutex_unlock(&q->head_lock);
+		return NULL;
+	}
+	printf(
+		"[pop()] awaken, queue has item\n"
+	);
+
+	void *item = pop(q);
+
+	int now_sz = atomic_load(&q->size);
+	printf("[pop()] POPPED! - queue size now: %d\n", now_sz);
+
+	pthread_cond_signal(&q->not_full);
+
+	pthread_mutex_unlock(&q->head_lock);
+	return item;
+}
+
+int async_queue_try_push(async_queue_t *q, void *item) {
+	if (!q || !item)
+		return -1;
+	pthread_mutex_lock(&q->tail_lock);
+	
+	if (async_queue_is_shutdown(q) || async_queue_full(q)) {
+		int new_sz = atomic_load(&q->size);
+		printf("[try_push()] queue full (size=%d) - RETURNING\n",
+			new_sz);
+		pthread_mutex_unlock(&q->tail_lock);
+		return -1;
 	}
 
 	if (async_queue_is_shutdown(q)) {
+		pthread_mutex_unlock(&q->tail_lock);
+		return -1;
+	}
+	
+	push(q, item);
+	int now_sz = atomic_load(&q->size);
+	printf("[try_push()] PUSHED! - queue size now: %d\n", now_sz);
+
+	pthread_cond_signal(&q->not_empty);
+
+	pthread_mutex_unlock(&q->tail_lock);
+	return 0;
+}
+
+void *async_queue_try_pop(async_queue_t *q) {
+	if (!q)
+		return NULL;
+	pthread_mutex_lock(&q->head_lock);
+
+	if (async_queue_is_shutdown(q) || async_queue_empty(q)) {
+		printf("[try_pop()] queue empty - RETURNING\n");
 		pthread_mutex_unlock(&q->head_lock);
 		return NULL;
 	}
 	
-	void *item = pop(q);
-	pthread_cond_signal(&q->not_full);
-
-	pthread_mutex_unlock(&q->head_lock);
-	return item;
-}
-
-/*
- * Non-blocking consumer/producer push/pops 
- *
- * returns 0 on success, -1 if queue full/empty, shutdown, or invalid parameters
-*/
-int async_queue_try_push(async_queue_t *q, void *item) {
-	if (!q || !item) return -1;
-	pthread_mutex_lock(&q->tail_lock);
-
-	if (async_queue_is_shutdown(q) || async_queue_full(q)) {
-		pthread_mutex_unlock(&q->tail_lock);
-		return -1;
-	}
-
-	push(q, item);
-	pthread_cond_signal(&q->not_empty);
-
-	pthread_mutex_unlock(&q->tail_lock);
-	return 0;
-}
-void *async_queue_try_pop(async_queue_t *q) {
-	if (!q) return NULL;
-	pthread_mutex_lock(&q->head_lock);
-
-	if (async_queue_is_shutdown(q) || async_queue_empty(q)) {
+	if (async_queue_is_shutdown(q)) {
 		pthread_mutex_unlock(&q->head_lock);
 		return NULL;
 	}
 
-	void *item = pop(q); 
+	void *item = pop(q);
+	int now_sz = atomic_load(&q->size);
+	printf("[try_push()] POPPED! - queue size now: %d\n", now_sz);
+
 	pthread_cond_signal(&q->not_full);
 
 	pthread_mutex_unlock(&q->head_lock);
 	return item;
 }
 
-// THESE COMMENTS ARE NOT ACCURATE WHATSOEVER
-/* - Constraints: 
- * 	* N < queue capacity - queue size 
- *
- * returns positive int indicating total successful pushes, 0 if non_block enabled & queue was full, 
- * or -1 on failure
- * 	* If full success: ret == in_cnt  
- * 	* If partial success: 0 < ret < in_cnt 
-*/
-__attribute__((always_inline, hot, nonnull))
-int async_queue_batch_push(async_queue_t *q, 
-                           const void **__restrict__ items, 
-                           const int n, 
-                           const int8_t non_block,
-			   size_t *__restrict__ in_cnt) {
-	if (n < 1) return -1;
+void async_queue_batch_push(
+	async_queue_t *q,
+	const void **__restrict__ items,
+	const int n,
+	const int8_t non_block,
+	size_t *__restrict__ in_cnt
+) {
+	if (!q || !items || n < 2 || !in_cnt)
+		return;
+	
 	*in_cnt = 0;
 	pthread_mutex_lock(&q->tail_lock);
 
-	if (!non_block) {
-		while (!async_queue_is_shutdown(q) && async_queue_full(q))
-			pthread_cond_wait(&q->not_full, &q->head_lock);
-	} else {
-		if (async_queue_is_shutdown(q) || async_queue_full(q)) {
+	if (non_block) {
+		while (async_queue_is_shutdown(q) || async_queue_full(q)) {
+			int new_sz = atomic_load(&q->size);
+			printf("[batch_push()] queue full (size=%d) - returning\n",
+				new_sz);
 			pthread_mutex_unlock(&q->tail_lock);
-			return -1;
+			return;
 		}
+	} else {
+		while (!async_queue_is_shutdown(q) && async_queue_full(q)) {
+			printf("[batch_push()] queue full - waiting for a pop\n");
+			pthread_cond_wait(&q->not_full, &q->tail_lock);
+		}
+		printf("[batch_push()] awaken, queue has space\n");
 	}
+
 	if (async_queue_is_shutdown(q)) {
 		pthread_mutex_unlock(&q->tail_lock);
-		return NULL;
+		return;
 	}
 
-	const size_t available = q->capacity - atomic_load(&q->size);
-	if (available == 0) {
+	const size_t space = q->capacity - atomic_load(&q->size);
+	if (space == 0) {
+		printf(
+		"[batch_push()] Need to push %d items but space in queue is %zu - RETURNING\n",
+		n, space
+		);
 		pthread_mutex_unlock(&q->tail_lock);
-		return -1;
+		return;
 	}
 
-	const size_t to_push = (available < n) ? available : n;
-	const size_t till_wrap = q->capacity - q->tail;
+	const size_t to_push = space > n ? n : space;
 
-	const size_t first_chunk = (to_push < till_wrap) ? to_push : till_wrap;
-	const size_t second_chunk = to_push - first_chunk;
+	size_t pushed = 0; 
+	for (size_t i = 0; i < to_push; ++i) {
+		push(q, (void*)items[i]);
+		++pushed;
+	}
+	*in_cnt = pushed;
 
-	memcpy(&q->items[q->tail], items, first_chunk * sizeof(void*));
-	if (second_chunk)
-		memcpy(&q->items[0], items + first_chunk, second_chunk * sizeof(void*));
-
-	q->tail = (q->tail + to_push) % q->capacity;
-	atomic_fetch_add(&q->size, to_push);
-	*in_cnt = to_push;
-
-	pthread_cond_signal(&q->not_empty);
-
+	pthread_cond_broadcast(&q->not_empty);
 	pthread_mutex_unlock(&q->tail_lock);
-	return (int)to_push;
 }
 
-__attribute__((always_inline, hot, nonnull))
-void **async_queue_batch_pop(async_queue_t *q,
-                            const size_t n,
-                            const int8_t non_block,
-                            size_t *__restrict__ out_cnt) {
-	if (n < 1) return NULL;
+void **async_queue_batch_pop(
+	async_queue_t *q,
+	const size_t n,
+	const int8_t non_block,
+	size_t *__restrict__ out_cnt
+) {
+	if (n < 2) 
+		return NULL;
 	*out_cnt = 0;
 	pthread_mutex_lock(&q->head_lock);
 
-	if (!non_block) {
-		while (!async_queue_is_shutdown(q) && async_queue_empty(q)) 
+	if (non_block) {
+		if (async_queue_is_shutdown(q) || async_queue_empty(q)) {
+			printf("[batch_pop()] queue empty - returning\n");
+			pthread_mutex_unlock(&q->head_lock);
+			return NULL;
+		}
+	} else {
+		while (async_queue_empty(q) && !async_queue_is_shutdown(q)) {
+			printf("[batch_pop()] queue empty - waiting for push()\n");
 			pthread_cond_wait(&q->not_empty, &q->head_lock);
+		}
+		printf("[batch_pop()] awaken - queue has item\n");
 	}
 
 	if (async_queue_is_shutdown(q)) {
@@ -331,50 +346,23 @@ void **async_queue_batch_pop(async_queue_t *q,
 	}
 
 	const size_t available = atomic_load(&q->size);
-	const size_t take = available < n ? available : n;
-
-	void **batch = aligned_alloc(32, sizeof(void*) * take);
-	if (!batch) {
+	if (available == 0) {
 		pthread_mutex_unlock(&q->head_lock);
 		return NULL;
 	}
+	const size_t to_pop = n > available ? available : n;
+	
+	void **items = malloc(sizeof(void*) * to_pop);
 
-	const size_t till_wrap = q->capacity - q->head; 
-	const size_t first_chunk = (take < till_wrap) ? take : till_wrap; 
-	const size_t second_chunk = take - first_chunk;
+	size_t popped = 0;
+	for (size_t i = 0; i < to_pop; i++) {
+		items[i] = pop(q);
+		++popped;	
+	}
 
-	memcpy(batch, &q->items[q->head], first_chunk * sizeof(void));
-	if (second_chunk)
-		memcpy(batch + first_chunk, &q->items[0], second_chunk * sizeof(void*));
-
-	q->head = (q->head + take) % q->capacity;
-	atomic_fetch_sub(&q->size, take);
-
-	pthread_cond_signal(&q->not_full);
-
+	*out_cnt = popped;
+	pthread_cond_broadcast(&q->not_full);
 	pthread_mutex_unlock(&q->head_lock);
-	
-	*out_cnt = take;
-	return batch;
+	return items;
 }
 
-int main(void) {
-	async_queue_t *q = async_queue_init(10, 10);
-	size_t pushed = 0;
-	char a = 'A', b = 'B', c = 'C', d = 'D', e = 'E';
-	const void *batch_in[] = { &a, &b, &c, &d, &e };
-
-	int rc = async_queue_batch_push(
-		q,
-		batch_in,
-		5, // batch size 
-		0, // non-block 
-		&pushed
-	);
-	
-	printf("pushed: %zu -- rc: %d\n", pushed, rc);
-	async_queue_print(q);
-	
-	async_queue_free(q);
-	return 0;
-}

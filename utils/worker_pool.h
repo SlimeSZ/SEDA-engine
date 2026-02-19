@@ -1,24 +1,21 @@
-#ifndef WORKER_POOL_H
-#define WORKER_POOL_H
-
-#define MAX_TASKS 448
-#define MAX_TASKS_PER_WORKER 32 
+#ifndef WORKER_POOLH
+#define WORKER_POOLH
 
 #include <pthread.h>
+#include <stdint.h>
 #include "async_queue.h"
 
-typedef struct {
-	void *task;				// actual task inside scheduler 
-	uint64_t scheduled_run_ns;		// which tick this execution corresponds to 
-} ready_entry_t;
+#define MAX_WORKERS_PER_SCHEDULER 448 		// max worker threads in a scheduler 
+// #define MAX_TASKS_PER_WORKERS // max logical tasks in each thread 
 
-/* Worker function ptr, executes entry based on opaque context */
-typedef void (*worker_entry_fn_t)(ready_entry_t *entry, void *ctx);
+typedef void *(*worker_entry_fn_t)(void *task, void *void_ctx);
 
 typedef struct {
-	_Atomic uint64_t *completion_map;	// scheduler's completion bitmap
-	int completion_eventfd;			// schedulers completion wake fd 
-	async_queue_t *output_queue;		// schedulers output_queue
+	_Atomic uint64_t *completion_map;	// borrowed from scheduler 
+	int completion_eventfd;			// borrowed from scheduler  
+	async_queue_t *output_queue;		// borrowed from scheduler
+	async_queue_t *ready_queue;		// borrowed from scheduler
+	worker_entry_fn_t entry_fn;
 } worker_ctx_t;
 
 typedef struct {
@@ -27,18 +24,17 @@ typedef struct {
 	_Atomic size_t num_free;
 	_Atomic size_t num_working;
 
-	async_queue_t *ready_queue;		// borrowed from scheduler not owned 
-	worker_entry_fn_t entry_fn;		// all workers call this fn first upon task execution
-	worker_ctx_t ctx;			// all workers refer to the same context struct
+	worker_ctx_t ctx;
 
+	int shutdown_eventfd; 		
 	_Atomic int shutdown;
 } worker_pool_t;
 
-/* API */
-worker_pool_t *worker_pool_init(size_t num_workers,
-	                        async_queue_t *ready_queue,
-                                worker_entry_fn_t entry_fn,
-                                worker_ctx_t ctx);
+worker_pool_t *worker_pool_init(
+	size_t size,
+	worker_ctx_t ctx
+);
 void worker_pool_shutdown(worker_pool_t *pool);
 
 #endif
+

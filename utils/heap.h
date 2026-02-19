@@ -1,7 +1,7 @@
 #ifndef HEAP_H
 #define HEAP_H
 
-#include "../producers/scheduler/scheduler.h"
+#include "../scheduler/scheduler.h"
 
 #define PARENT(idx) (idx - 1) / 2
 #define LEFT(idx) 2 * idx + 1
@@ -70,3 +70,5 @@ static inline int heap_empty(const scheduler_t *s) { return s->size == 0; }
 static inline int heap_full(const scheduler_t *s) { return s->size >= s->capacity; }
 
 #endif
+
+
