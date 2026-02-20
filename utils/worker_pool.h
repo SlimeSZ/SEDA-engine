@@ -10,12 +10,15 @@
 
 typedef void *(*worker_entry_fn_t)(void *task, void *void_ctx);
 
+struct scheduler_t;
+
 typedef struct {
 	_Atomic uint64_t *completion_map;	// borrowed from scheduler 
 	int completion_eventfd;			// borrowed from scheduler  
 	async_queue_t *output_queue;		// borrowed from scheduler
 	async_queue_t *ready_queue;		// borrowed from scheduler
 	worker_entry_fn_t entry_fn;
+	struct scheduler_t *sched;
 } worker_ctx_t;
 
 typedef struct {

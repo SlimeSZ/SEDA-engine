@@ -29,6 +29,9 @@ static void *worker_thread_routine(void *arg) {
 			if (!task) // NULL means shutdown 
 				break;
         	}
+		printf(
+			"[worker_thread_routine()] worker popped task from ready queue\n"
+		);
 		atomic_fetch_add(&pool->num_working, 1);
 		atomic_fetch_sub(&pool->num_free, 1);
 
@@ -66,6 +69,7 @@ worker_pool_t *worker_pool_init(
 	atomic_store(&pool->shutdown, 0);
 
 	// create N threads & send to sit idle until task's ready
+	int created = 0;
 	for (size_t i = 0; i < size; i++) {
 		if (pthread_create(&pool->workers[i], NULL, worker_thread_routine, pool)
 			!= 0) {
@@ -76,7 +80,13 @@ worker_pool_t *worker_pool_init(
 			free(pool);
 			return NULL;
 		}
+		created++;
 	}
+	printf(
+		"[worker_pool_init()] Created %d worker threads\n", created
+	);
+	
+
 	return pool;
 }
 
@@ -99,6 +109,7 @@ void worker_pool_shutdown(worker_pool_t *pool) {
 	// allow idle, and more importantly mid-execution workers to complete
 	for (size_t i = 0; i < pool->size; i++) 
 		pthread_join(pool->workers[i], NULL);
+	printf("[worker_pool_shutdown()] workers all shutdown\n");
 	free(pool->workers);
 	free(pool);
 }

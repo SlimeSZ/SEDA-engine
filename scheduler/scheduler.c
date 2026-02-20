@@ -5,6 +5,7 @@
 #include "../utils/worker_pool.h"
 #include <bits/time.h>
 #include <bits/types/struct_itimerspec.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -35,6 +36,18 @@ static void sched_state_change(scheduler_t *s) {
 	while ((payload = async_queue_try_pop(s->sched_ctrl_queue)) != NULL) {
 		switch (payload->op) {
 			case SCHED_ADD:
+				sched_ctrl_add_task(
+					s,
+					payload->add.task_fn,
+					payload->add.arg,
+					payload->add.interval_ns,
+					payload->add.miss_policy
+				);
+				break;
+			case SCHED_ADD_MANY:
+				//for (size_t i = 0; i < payload->add_many.count; i++) 
+				//	sched_ctrl_add_task(s, payload->add_many.tasks[i]);
+				//free(payload->add_many.tasks);
 				break;
 			case SCHED_REMOVE:
 				break;
@@ -106,6 +119,7 @@ void *entry_fn(void *void_task, void *void_ctx) {
 	if (interval_ns > 0 && now_ns > scheduled_ns + interval_ns) {
 		uint64_t missed = (now_ns - scheduled_ns) / interval_ns;
 		atomic_store(&task->missed_runs, missed);
+		// shouldnt we return here??	
 	}
 
 	task_state_t prev_state = atomic_exchange(&task->state, TASK_RUNNING);
@@ -116,8 +130,23 @@ void *entry_fn(void *void_task, void *void_ctx) {
 		atomic_store(&task->actual_run_ns, end_ns - start_ns);
 		atomic_fetch_add(&task->run_count, 1);
 		atomic_store(&task->state, TASK_SCHEDULED);
+
+		printf("[entry_fn()] task executed - res: %p\n",
+			task->result);
+		
+		scheduler_entry_t entry = {
+			.task = task,
+			.next_run_ns = scheduled_ns + interval_ns
+		};
+		heap_push(ctx->sched, &entry);
+		uint64_t nxt = ctx->sched->heap[0].next_run_ns;
+		struct itimerspec its = {0};
+		its.it_value.tv_sec  = nxt / 1000000000ULL;
+		its.it_value.tv_nsec = nxt % 1000000000ULL;
+		timerfd_settime(ctx->sched->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 	} else {
 		atomic_store(&task->state, TASK_ZOMBIE);
+		printf("[entry_fn()] task was cancelled - exiting without execution\n");
 		return NULL;
 	}
 
@@ -196,7 +225,8 @@ scheduler_t *scheduler_init(
 		.completion_eventfd = s->task_completion_fd,
 		.output_queue = s->task_output_queue,
 		.ready_queue = s->task_ready_queue,
-		.entry_fn = &entry_fn
+		.entry_fn = &entry_fn,
+		.sched = s
 	};
 	s->worker_pool = worker_pool_init(workers, worker_ctx);
 	if (!s->worker_pool) 
@@ -227,15 +257,6 @@ fail_heap:
 	free(s);
 	return NULL;
 }
-
-/* TO BE MOVED TO DIFFERENT FILE */
-void sched_ctrl_shutdown(scheduler_t *s);
-int sched_ctrl_add_task(scheduler_t *s, task_t *task);
-int sched_ctrl_rm_task(scheduler_t *s, task_t *task);
-int sched_ctrl_pause_task(scheduler_t *s, task_t *task);
-int sched_ctrl_resume_task(scheduler_t *s, task_t *task);
-int sched_ctrl_reschedule_task(scheduler_t *s, task_t *task);
-
 
 
 /*
@@ -291,73 +312,72 @@ int scheduler_run(scheduler_t *s) {
 	return 0;
 }
 
+/* ----------------------- test ------------------------------ */
+
+#include <unistd.h>
+
+static int param1 = 1,  param2 = 2,  param3 = 3,  param4 = 4,  param5 = 5;
+static int param6 = 6,  param7 = 7,  param8 = 8,  param9 = 9,  param10 = 10;
+
+void *foo1(void *arg)  { printf("[foo1]  %d\n", *(int*)arg); return arg; }
+void *foo2(void *arg)  { printf("[foo2]  %d\n", *(int*)arg); return arg; }
+void *foo3(void *arg)  { printf("[foo3]  %d\n", *(int*)arg); return arg; }
+void *foo4(void *arg)  { printf("[foo4]  %d\n", *(int*)arg); return arg; }
+void *foo5(void *arg)  { printf("[foo5]  %d\n", *(int*)arg); return arg; }
+void *foo6(void *arg)  { usleep(800000); printf("[foo6-slow]  %d\n", *(int*)arg); return arg; }
+void *foo7(void *arg)  { usleep(800000); printf("[foo7-slow]  %d\n", *(int*)arg); return arg; }
+void *foo8(void *arg)  { usleep(800000); printf("[foo8-slow]  %d\n", *(int*)arg); return arg; }
+
+void *foo9(void *arg)  { 
+    volatile long x = 0; 
+    for (long i = 0; i < 50000000L; i++) x += i; 
+    printf("[foo9-spin]  %d\n", *(int*)arg); 
+    return arg; 
+}
+void *foo10(void *arg) { 
+    volatile long x = 0; 
+    for (long i = 0; i < 50000000L; i++) x += i; 
+    printf("[foo10-spin] %d\n", *(int*)arg); 
+    return arg; 
+}
+
+void *output_routine(void *arg) {
+    async_queue_t *out_q = (async_queue_t *)arg;
+    void *res;
+    while ((res = async_queue_pop(out_q)) != NULL)
+        printf("Result: %d\n", *(int*)res);
+    return NULL;
+}
 
 int main(void) {
-	// init 
-	async_queue_t *out_q = async_queue_init(100);
-	if (!out_q) return -1;
+    pthread_t out_thread;
+    async_queue_t *out_q = async_queue_init(100);
+    if (!out_q) return -1;
+    pthread_create(&out_thread, NULL, output_routine, out_q);
 
-	scheduler_t *sched = scheduler_init(
-		5, 5, out_q
-	);	
-	if (!sched) return -1;
+    scheduler_t *sched = scheduler_init(20, 10, out_q); // 20 workers, 10 tasks
+    if (!sched) return -1;
 
-	// add 5 tasks 
-	
-	// run scheduler 
-	scheduler_run(sched);
+    uint64_t ms = 1000000ULL;
 
-	// exit 
-	async_queue_free(out_q);
-	scheduler_shutdown(sched);
-	return 0;
+    sched_ctrl_add_task(sched, foo1,  &param1,  500  * ms, TASK_MISS_SKIP);
+    sched_ctrl_add_task(sched, foo2,  &param2,  500  * ms, TASK_MISS_SKIP);
+    sched_ctrl_add_task(sched, foo3,  &param3,  750  * ms, TASK_MISS_SKIP);
+    sched_ctrl_add_task(sched, foo4,  &param4,  750  * ms, TASK_MISS_SKIP);
+    sched_ctrl_add_task(sched, foo5,  &param5,  1000 * ms, TASK_MISS_SKIP);
+    sched_ctrl_add_task(sched, foo6,  &param6,  1000 * ms, TASK_MISS_SKIP); // slow
+    sched_ctrl_add_task(sched, foo7,  &param7,  1000 * ms, TASK_MISS_SKIP); // slow
+    sched_ctrl_add_task(sched, foo8,  &param8,  1500 * ms, TASK_MISS_SKIP); // slow
+    sched_ctrl_add_task(sched, foo9,  &param9,  1500 * ms, TASK_MISS_SKIP); // spin
+    sched_ctrl_add_task(sched, foo10, &param10, 2000 * ms, TASK_MISS_SKIP); // spin
+
+    scheduler_run(sched);
+
+    async_queue_shutdown(out_q);
+    pthread_join(out_thread, NULL);
+    async_queue_free(out_q);
+    return 0;
 }
-
-
-/*
-int sched_add_task(scheduler_t *s, task_t *task) {
-	if (!s || !task)
-		return -1;
-
-	task_state_t curr_state = atomic_load(&task->state);
-	if (curr_state != TASK_REGISTERED)
-		return -1;
-
-	if (s->size >= s->capacity)
-		return -1;
-	
-	uint64_t old_min_deadline = (s->size > 0) ? s->heap[0].next_run_ns : UINT64_MAX;
-	
-	// Create entry
-	scheduler_entry_t entry = {
-		.task = task,
-		.next_run_ns = get_monotonic_ns() + task->interval_ns
-	};
-
-	// Push to heap
-	if (heap_push(s, &entry) != 0) 
-		return -1;
-
-	atomic_store(&task->state, TASK_SCHEDULED);
-
-	// Rearm timer if new task is earliest
-	uint64_t new_min_deadline = s->heap[0].next_run_ns;
-	if (new_min_deadline < old_min_deadline) {
-		struct itimerspec its = {0};
-		its.it_value.tv_sec = new_min_deadline / 1000000000ULL;
-		its.it_value.tv_nsec = new_min_deadline % 1000000000ULL;
-		if (timerfd_settime(s->timer_fd, TFD_TIMER_ABSTIME, &its, NULL) < 0) 
-			return -1;
-	}
-
-	return 0;
-}
-*/
-
-
-
-
-
 
 
 

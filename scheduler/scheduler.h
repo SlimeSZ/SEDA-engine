@@ -7,17 +7,38 @@
 
 typedef enum {
 	SCHED_ADD = 0,
+	SCHED_ADD_MANY,
 	SCHED_REMOVE,
 	SCHED_RESCHEDULE,
 	SCHED_PAUSE,
 	SCHED_RESUME
 } scheduler_ctrl_op_t;
 
+typedef enum {
+	TASK_MISS_SKIP = 0, 			// discard any missed executions, no backlog, predictable rate 
+	TASK_MISS_COALESCE,			// missed executions collapse into a single execution 
+	TASK_MISS_CATCHUP			// replay N missed executions N times consecutively
+} task_miss_policy_t;
+
+
 typedef struct task_t task_t;
 typedef struct {
 	scheduler_ctrl_op_t op;
-	task_t *task; 			// optional
-	uint64_t new_interval_ns;	// optional 
+	union {
+		struct {
+			void *(*task_fn)(void*arg);
+			void *arg;
+			uint64_t interval_ns;
+			task_miss_policy_t miss_policy;
+		} add;
+		struct {
+				
+		} add_many;
+
+		struct {
+		} remove;
+
+	};
 } scheduler_ctrl_payload_t;
 
 typedef enum {
@@ -27,12 +48,6 @@ typedef enum {
 	TASK_CANCELLED,
 	TASK_ZOMBIE
 } task_state_t;
-
-typedef enum {
-	TASK_MISS_SKIP = 0, 			// discard any missed executions, no backlog, predictable rate 
-	TASK_MISS_COALESCE,			// missed executions collapse into a single execution 
-	TASK_MISS_CATCHUP			// replay N missed executions N times consecutively
-} task_miss_policy_t;
 
 struct task_t {
 	void *(*task_fn)(void*arg);
@@ -58,7 +73,7 @@ typedef struct {
 	uint64_t next_run_ns;
 } scheduler_entry_t; 
 
-typedef struct {
+typedef struct scheduler_t {
 	scheduler_entry_t *heap;
 	size_t size;
 	size_t capacity;
@@ -80,6 +95,8 @@ typedef struct {
 
 	_Atomic int shutdown;
 } scheduler_t;
+
+uint64_t get_monotonic_ns(void);
 
 /* API 
 scheduler_t *scheduler_init(size_t initial_workers,
