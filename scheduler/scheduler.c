@@ -36,18 +36,17 @@ static void sched_state_change(scheduler_t *s) {
 	while ((payload = async_queue_try_pop(s->sched_ctrl_queue)) != NULL) {
 		switch (payload->op) {
 			case SCHED_ADD:
-				sched_ctrl_add_task(
-					s,
-					payload->add.task_fn,
-					payload->add.arg,
-					payload->add.interval_ns,
-					payload->add.miss_policy
-				);
+				if (sched_ctrl_add_task(s, payload->add.task) != 0)
+					printf("Err [sched_ctrl_add_task]\n");
 				break;
 			case SCHED_ADD_MANY:
-				//for (size_t i = 0; i < payload->add_many.count; i++) 
-				//	sched_ctrl_add_task(s, payload->add_many.tasks[i]);
-				//free(payload->add_many.tasks);
+				int pushed = sched_ctrl_add_many_tasks(
+					s, payload->add_many.tasks, payload->add_many.count
+				);
+				if (pushed != (int)payload->add_many.count)	
+					printf("Err [sched_ctrl_add_tasks] pushed only %d/%zu\n",
+						pushed, payload->add_many.count);
+				free(payload->add_many.tasks);
 				break;
 			case SCHED_REMOVE:
 				break;
@@ -275,6 +274,51 @@ void scheduler_shutdown(scheduler_t *s) {
 	write(s->sched_ctrl_fd, &x, sizeof(x));  
 }
 
+// add logical error returns 
+int scheduler_add_task(scheduler_t *s, user_task_t *user_task) {
+	scheduler_ctrl_payload_t *payload = malloc(sizeof(scheduler_ctrl_payload_t));
+	if (!payload)
+		return -1;
+	payload->op = SCHED_ADD;
+	payload->add.task = *user_task;
+
+	if (async_queue_try_push(s->sched_ctrl_queue, payload) != 0) {
+		free(payload);
+		return -1;
+	}
+
+	uint64_t x = 1;
+	write(s->sched_ctrl_fd, &x, sizeof(x));
+	return 0;
+}
+
+int scheduler_add_tasks(scheduler_t *s, user_task_t *user_tasks, size_t count) {
+	scheduler_ctrl_payload_t *payload = malloc(sizeof(scheduler_ctrl_payload_t));
+	if (!payload)
+		return -1;
+
+	payload->op = SCHED_ADD_MANY;
+	payload->add_many.tasks = malloc(count * sizeof(user_task_t));
+	if (!payload->add_many.tasks) {
+		free(payload);
+		return -1;
+	}
+	memcpy(payload->add_many.tasks, user_tasks, count * sizeof(user_task_t));
+	payload->add_many.count = count;
+
+	if (async_queue_try_push(s->sched_ctrl_queue, payload) != 0) {
+		free(payload->add_many.tasks);
+		free(payload);
+		return -1;
+	}
+
+	uint64_t x = 1;
+	write(s->sched_ctrl_fd, &x, sizeof(x));
+	return 0;
+}
+
+
+
 int scheduler_run(scheduler_t *s) {
 	if (!s) 
 		return -1;
@@ -349,34 +393,41 @@ void *output_routine(void *arg) {
     return NULL;
 }
 
+/*--------------- USAGE ------------------------*/
 int main(void) {
-    pthread_t out_thread;
-    async_queue_t *out_q = async_queue_init(100);
-    if (!out_q) return -1;
-    pthread_create(&out_thread, NULL, output_routine, out_q);
+	pthread_t out_thread;
+	async_queue_t *out_q = async_queue_init(100);
+	if (!out_q) return -1;
+	pthread_create(&out_thread, NULL, output_routine, out_q);
 
-    scheduler_t *sched = scheduler_init(20, 10, out_q); // 20 workers, 10 tasks
-    if (!sched) return -1;
+	size_t num_workers = 20, num_tasks = 10;
+	scheduler_t *sched = scheduler_init(num_workers, num_tasks, out_q); // 20 workers, 10 tasks 
+	if (!sched) 
+		return -1;
 
-    uint64_t ms = 1000000ULL;
+	uint64_t ms = 1000000ULL;
 
-    sched_ctrl_add_task(sched, foo1,  &param1,  500  * ms, TASK_MISS_SKIP);
-    sched_ctrl_add_task(sched, foo2,  &param2,  500  * ms, TASK_MISS_SKIP);
-    sched_ctrl_add_task(sched, foo3,  &param3,  750  * ms, TASK_MISS_SKIP);
-    sched_ctrl_add_task(sched, foo4,  &param4,  750  * ms, TASK_MISS_SKIP);
-    sched_ctrl_add_task(sched, foo5,  &param5,  1000 * ms, TASK_MISS_SKIP);
-    sched_ctrl_add_task(sched, foo6,  &param6,  1000 * ms, TASK_MISS_SKIP); // slow
-    sched_ctrl_add_task(sched, foo7,  &param7,  1000 * ms, TASK_MISS_SKIP); // slow
-    sched_ctrl_add_task(sched, foo8,  &param8,  1500 * ms, TASK_MISS_SKIP); // slow
-    sched_ctrl_add_task(sched, foo9,  &param9,  1500 * ms, TASK_MISS_SKIP); // spin
-    sched_ctrl_add_task(sched, foo10, &param10, 2000 * ms, TASK_MISS_SKIP); // spin
+	user_task_t tasks[] = {
+		{ .task_fn = foo1,  .arg = &param1,  .interval_ns = 500 * ms,  .miss_policy = TASK_MISS_SKIP },
+		{ .task_fn = foo2,  .arg = &param2,  .interval_ns = 500 * ms,  .miss_policy = TASK_MISS_SKIP },
+		{ .task_fn = foo3,  .arg = &param3,  .interval_ns = 750 * ms,  .miss_policy = TASK_MISS_SKIP },
+		{ .task_fn = foo4,  .arg = &param4,  .interval_ns = 750 * ms,  .miss_policy = TASK_MISS_SKIP },
+		{ .task_fn = foo5,  .arg = &param5,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },
+		{ .task_fn = foo6,  .arg = &param6,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },  
+		{ .task_fn = foo7,  .arg = &param7,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },  
+		{ .task_fn = foo8,  .arg = &param8,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },  
+		{ .task_fn = foo9,  .arg = &param9,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },  
+		{ .task_fn = foo10, .arg = &param10, .interval_ns = 2000 * ms, .miss_policy = TASK_MISS_SKIP }  
+	};	
+	scheduler_add_tasks(sched, tasks, num_tasks);
 
-    scheduler_run(sched);
+	scheduler_run(sched);
 
-    async_queue_shutdown(out_q);
-    pthread_join(out_thread, NULL);
-    async_queue_free(out_q);
-    return 0;
+	async_queue_shutdown(out_q);
+	pthread_join(out_thread, NULL);
+	async_queue_free(out_q);
+
+	return 0;
 }
 
 

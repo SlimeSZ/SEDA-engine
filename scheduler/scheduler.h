@@ -20,23 +20,26 @@ typedef enum {
 	TASK_MISS_CATCHUP			// replay N missed executions N times consecutively
 } task_miss_policy_t;
 
+// user-defined task for scheduler_ctrl_payload_t
+typedef struct {
+	void *(*task_fn)(void*arg);
+	void *arg;
+	uint64_t interval_ns;
+	task_miss_policy_t miss_policy;
+} user_task_t;
+
 
 typedef struct task_t task_t;
 typedef struct {
 	scheduler_ctrl_op_t op;
 	union {
 		struct {
-			void *(*task_fn)(void*arg);
-			void *arg;
-			uint64_t interval_ns;
-			task_miss_policy_t miss_policy;
+			user_task_t task;
 		} add;
 		struct {
-				
+			user_task_t *tasks;
+			size_t count;	
 		} add_many;
-
-		struct {
-		} remove;
 
 	};
 } scheduler_ctrl_payload_t;

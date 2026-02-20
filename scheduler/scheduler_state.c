@@ -60,8 +60,11 @@ void sched_ctrl_shutdown(scheduler_t *s) {
 
 	// 7) 
 	scheduler_ctrl_payload_t *pending_sched_req;
-	while ((pending_sched_req = async_queue_try_pop(s->sched_ctrl_queue)) != NULL) 
+	while ((pending_sched_req = async_queue_try_pop(s->sched_ctrl_queue)) != NULL) { 
+		if (pending_sched_req->op == SCHED_ADD_MANY)
+			free(pending_sched_req->add_many.tasks);
 		free(pending_sched_req);
+	}
 	printf("[sched_shutdown()] ctrl q drained - size: %d\n",
 		atomic_load(&s->sched_ctrl_queue->size));
 	async_queue_free(s->sched_ctrl_queue);
@@ -81,20 +84,14 @@ void sched_ctrl_shutdown(scheduler_t *s) {
 	free(s);
 }
 
-int sched_ctrl_add_task(
-	scheduler_t *s, 
-	void *(*task_fn)(void*arg), 
-	void *arg,
-	uint64_t interval_ns,
-	task_miss_policy_t miss_policy
-) {
+int sched_ctrl_add_task(scheduler_t *s, user_task_t user_task) {
 	if (s->size >= s->capacity)
 		return -1;
 
 	if (
-		!task_fn || 
-		interval_ns == 0 || 
-		miss_policy > TASK_MISS_CATCHUP
+		!user_task.task_fn || 
+		user_task.interval_ns == 0 || 
+		user_task.miss_policy > TASK_MISS_CATCHUP
 	) 
 		return -1;
 	
@@ -103,17 +100,17 @@ int sched_ctrl_add_task(
 	if (!task) 
 		return -1;
 
-	task->task_fn = task_fn;
-	task->arg = arg;
-	task->interval_ns = interval_ns;
-	task->miss_policy = miss_policy;
+	task->task_fn = user_task.task_fn;
+	task->arg = user_task.arg;
+	task->interval_ns = user_task.interval_ns;
+	task->miss_policy = user_task.miss_policy;
 
 	uint64_t old_min_deadline = (s->size > 0) ? s->heap[0].next_run_ns : UINT64_MAX;
 	
 	// push to heap 
 	scheduler_entry_t heap_entry = {
 		.task = task,
-		.next_run_ns = get_monotonic_ns() + interval_ns
+		.next_run_ns = get_monotonic_ns() + user_task.interval_ns
 	};
 	if (heap_push(s, &heap_entry) != 0) {
 		free(task);
@@ -131,62 +128,23 @@ int sched_ctrl_add_task(
 
 	return 0;
 }
-/*
-int sched_ctrl_add_task(
-	scheduler_t *s, 
-	void *(*task_fn)(void*arg), 
-	void *arg,
-	uint64_t interval_ns,
-	task_miss_policy_t miss_policy
+
+int sched_ctrl_add_many_tasks(
+	scheduler_t *s,
+	user_task_t *user_tasks,
+	size_t count
 ) {
-	printf("[add_task] entered\n");
-	if (s->size >= s->capacity) return -1;
-	if (!task_fn || interval_ns == 0 || miss_policy > TASK_MISS_CATCHUP) return -1;
-	
-	printf("[add_task] allocating task\n");
-	task_t *task = calloc(1, sizeof(task_t));
-	if (!task) return -1;
-
-	task->task_fn = task_fn;
-	task->arg = arg;
-	task->interval_ns = interval_ns;
-	task->miss_policy = miss_policy;
-
-	printf("[add_task] s=%p, s->heap=%p, s->size=%zu, s->capacity=%zu\n",
-		(void*)s, (void*)s->heap, s->size, s->capacity);
-
-	uint64_t old_min_deadline = (s->size > 0) ? s->heap[0].next_run_ns : UINT64_MAX;
-	
-	scheduler_entry_t heap_entry = {
-		.task = task,
-		.next_run_ns = get_monotonic_ns() + interval_ns
-	};
-
-	printf("[add_task] pushing to heap\n");
-	if (heap_push(s, &heap_entry) != 0) {
-		free(task);
+	if (s->size >= s->capacity || count <= 2)
 		return -1;
-	}
+	
+	int pushed = 0;
 
-	printf("[add_task] heap pushed, size now: %zu\n", s->size);
-	atomic_store(&task->state, TASK_SCHEDULED);
+	for (size_t i = 0; i < count; i++) 
+		if (sched_ctrl_add_task(s, user_tasks[i]) == 0)
+			pushed++;
 
-	uint64_t new_min_deadline = s->heap[0].next_run_ns;
-	if (new_min_deadline < old_min_deadline) {
-		struct itimerspec its = {0};
-		its.it_value.tv_sec = new_min_deadline / 1000000000ULL;
-		its.it_value.tv_nsec = new_min_deadline % 1000000000ULL;
-		printf("[add_task] arming timerfd\n");
-		timerfd_settime(s->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
-	}
-
-	printf("[add_task] done - interval_ns: %lu\n", task->interval_ns);
-	return 0;
+	return pushed;
 }
-*/
-
-
-
 
 
 
