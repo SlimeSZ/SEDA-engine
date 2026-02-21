@@ -49,6 +49,11 @@ static void sched_state_change(scheduler_t *s) {
 				free(payload->add_many.tasks);
 				break;
 			case SCHED_REMOVE:
+				if (sched_ctrl_rm_task(s, payload->remove.task_id) != 0) 
+					printf(
+						"Err [sched_ctrl_rm_task] unable to rm task with id: %d\n",
+						payload->remove.task_id
+					);
 				break;
 			case SCHED_PAUSE:
 				break;
@@ -80,9 +85,10 @@ static void task_timerfd_wake(scheduler_t *s) {
 		task_t *task = heap_entry.task;
 		
 		task_state_t task_state = atomic_load(&task->state);
-		if (task_state == TASK_CANCELLED || task_state == TASK_ZOMBIE)
+		if (task_state == TASK_CANCELLED || task_state == TASK_ZOMBIE) {
+			printf("[timerfd_wake()] task cancelled mid-execution - aborting\n");
 			continue;
-		printf("[timerfd_wake()] task state: %c\n", task_state);
+		}
 
 		atomic_store(&task->state, TASK_RUNNING);
 		atomic_store(&task->scheduled_ns, get_monotonic_ns());
@@ -121,17 +127,32 @@ void *entry_fn(void *void_task, void *void_ctx) {
 		// shouldnt we return here??	
 	}
 
+	printf("[entry_fn] id=%d prev_state before exchange=%d\n", task->id, atomic_load(&task->state));
 	task_state_t prev_state = atomic_exchange(&task->state, TASK_RUNNING);
+	printf("[entry_fn] id=%d prev_state after exchange=%d\n", task->id, prev_state);
 	if (prev_state != TASK_CANCELLED) {
 		uint64_t start_ns = get_monotonic_ns();
 		task->result = task->task_fn(task->arg);
 		uint64_t end_ns = get_monotonic_ns();
 		atomic_store(&task->actual_run_ns, end_ns - start_ns);
 		atomic_fetch_add(&task->run_count, 1);
+		
+		// check again, task-remove races (may have been cancelled while executing)
+		task_state_t post_state = atomic_load(&task->state);
+		if (post_state == TASK_CANCELLED) {
+			int id = task->id;
+			pthread_mutex_lock(&ctx->sched->task_id_lock);
+			ctx->sched->task_id_bitmap[id/64] &= ~(1ULL << (id % 64));
+			pthread_mutex_unlock(&ctx->sched->task_id_lock);
+			ctx->sched->task_registry[id] = NULL;
+			free(task);
+			return NULL;
+		}
+
 		atomic_store(&task->state, TASK_SCHEDULED);
 
-		printf("[entry_fn()] task executed - res: %p\n",
-			task->result);
+		// printf("[entry_fn()] task executed - res: %p\n",
+		// 	task->result);
 		
 		scheduler_entry_t entry = {
 			.task = task,
@@ -145,6 +166,11 @@ void *entry_fn(void *void_task, void *void_ctx) {
 		timerfd_settime(ctx->sched->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 	} else {
 		atomic_store(&task->state, TASK_ZOMBIE);
+		pthread_mutex_lock(&ctx->sched->task_id_lock);
+		ctx->sched->task_id_bitmap[task->id/64] &= ~(1ULL << (task->id % 64));
+		pthread_mutex_unlock(&ctx->sched->task_id_lock);
+		ctx->sched->task_registry[task->id] = NULL;
+		free(task);
 		printf("[entry_fn()] task was cancelled - exiting without execution\n");
 		return NULL;
 	}
@@ -231,9 +257,14 @@ scheduler_t *scheduler_init(
 	if (!s->worker_pool) 
 		goto fail_worker_pool;
 
+	if (pthread_mutex_init(&s->task_id_lock, NULL) != 0) 
+		goto fail_taskid_lock;
+
 	atomic_store(&s->shutdown, 0);
 	return s;
 
+fail_taskid_lock:
+	worker_pool_shutdown(s->worker_pool);
 fail_worker_pool:
 	async_queue_free(s->sched_ctrl_queue);
 fail_ctrl_queue:
@@ -276,47 +307,148 @@ void scheduler_shutdown(scheduler_t *s) {
 
 // add logical error returns 
 int scheduler_add_task(scheduler_t *s, user_task_t *user_task) {
+	int task_id = -1;
+	pthread_mutex_lock(&s->task_id_lock);
+	for (size_t i = 0; i < MAX_TASKS_PER_SCHEDULER / 64 + 1; i++) {
+		uint64_t word = s->task_id_bitmap[i];
+		if (word == UINT64_MAX)
+			continue;
+		for (size_t b = 0; b < 64; b++) {
+			size_t idx = (i << 6) + b;
+			if (idx >= MAX_TASKS_PER_SCHEDULER)
+				break;
+			if ((word & (1ULL << b)) == 0) {
+				task_id = (int)idx;
+				s->task_id_bitmap[i] |= (1ULL << b);
+				break;
+			}
+		}
+		if (task_id >= 0)
+			break;
+	}
+	pthread_mutex_unlock(&s->task_id_lock);
+
+	if (task_id < 0) 
+		return -1;
+
+
 	scheduler_ctrl_payload_t *payload = malloc(sizeof(scheduler_ctrl_payload_t));
 	if (!payload)
 		return -1;
 	payload->op = SCHED_ADD;
 	payload->add.task = *user_task;
+	payload->add.task.id = task_id;
 
 	if (async_queue_try_push(s->sched_ctrl_queue, payload) != 0) {
 		free(payload);
+		pthread_mutex_lock(&s->task_id_lock);
+		s->task_id_bitmap[task_id / 64] &= ~(1ULL << (task_id % 64));
+		pthread_mutex_unlock(&s->task_id_lock);
 		return -1;
 	}
 
 	uint64_t x = 1;
 	write(s->sched_ctrl_fd, &x, sizeof(x));
-	return 0;
+
+	return task_id;
 }
 
-int scheduler_add_tasks(scheduler_t *s, user_task_t *user_tasks, size_t count) {
+int *scheduler_add_tasks(scheduler_t *s, user_task_t *user_tasks, size_t count) {
+	int task_ids[count];
+	pthread_mutex_lock(&s->task_id_lock);
+	for (size_t t = 0; t < count; t++) {
+		task_ids[t] = -1;
+		for (size_t i = 0; i < MAX_TASKS_PER_SCHEDULER / 64 + 1; i++) {
+			uint64_t word = s->task_id_bitmap[i];
+			if (word == UINT64_MAX)
+				continue;
+			for (size_t b = 0; b < 64; b++) {
+				size_t idx = (i << 6) + b;
+				if (idx >= MAX_TASKS_PER_SCHEDULER)
+					break;
+				if ((word & (1ULL << b)) == 0) {
+					task_ids[t] = (int)idx;
+					s->task_id_bitmap[i] |= (1ULL << b);
+					break;
+				}
+			}
+			if (task_ids[t] >= 0)
+				break;
+		}
+
+		if (task_ids[t] < 0) {
+			for (size_t r = 0; r < t; r++) 
+				s->task_id_bitmap[task_ids[r]/64] &= ~(1ULL << 
+					(task_ids[r] % 64));
+			pthread_mutex_unlock(&s->task_id_lock);
+			return NULL;
+		}
+	}
+	pthread_mutex_unlock(&s->task_id_lock);
+
 	scheduler_ctrl_payload_t *payload = malloc(sizeof(scheduler_ctrl_payload_t));
 	if (!payload)
-		return -1;
+		return NULL;
 
 	payload->op = SCHED_ADD_MANY;
+	payload->add_many.count = count;
+
 	payload->add_many.tasks = malloc(count * sizeof(user_task_t));
 	if (!payload->add_many.tasks) {
 		free(payload);
-		return -1;
+		return NULL;
 	}
 	memcpy(payload->add_many.tasks, user_tasks, count * sizeof(user_task_t));
-	payload->add_many.count = count;
+
+	for (size_t t = 0; t < count; t++)
+		payload->add_many.tasks[t].id = task_ids[t];
 
 	if (async_queue_try_push(s->sched_ctrl_queue, payload) != 0) {
 		free(payload->add_many.tasks);
 		free(payload);
+		return NULL;
+	}
+
+	uint64_t x = 1;
+	write(s->sched_ctrl_fd, &x, sizeof(x));
+
+	int *ret_ids = malloc(count * sizeof(int));
+	if (!ret_ids) {
+		// pthread_mutex_lock(&s->task_id_lock);
+		// for (size_t r = 0; r < count; r++)
+		// 	s->task_id_bitmap[task_ids[r]/64] &=
+		// 		~(1ULL << (task_ids[r] % 64));
+		// pthread_mutex_unlock(&s->task_id_lock);
+		/* just accepting NULL ret for now, no rollback */
+		return NULL; 
+	}
+	memcpy(ret_ids, task_ids, count * sizeof(int));
+	return ret_ids;
+}
+
+int scheduler_remove_task(scheduler_t *s, int task_id) {
+	if (task_id < 0 || task_id >= MAX_TASKS_PER_SCHEDULER)
+		return -1;
+	if (s->size == 0) 
+		return -1;
+
+	scheduler_ctrl_payload_t *payload = malloc(sizeof(scheduler_ctrl_payload_t));
+	if (!payload)
+		return -1;
+
+	payload->op = SCHED_REMOVE;
+	payload->remove.task_id = task_id; 
+
+	if (async_queue_try_push(s->sched_ctrl_queue, payload) != 0) {
+		free(payload);
 		return -1;
 	}
 
 	uint64_t x = 1;
 	write(s->sched_ctrl_fd, &x, sizeof(x));
+	
 	return 0;
 }
-
 
 
 int scheduler_run(scheduler_t *s) {
@@ -394,43 +526,78 @@ void *output_routine(void *arg) {
 }
 
 /*--------------- USAGE ------------------------*/
-int main(void) {
-	pthread_t out_thread;
-	async_queue_t *out_q = async_queue_init(100);
-	if (!out_q) return -1;
-	pthread_create(&out_thread, NULL, output_routine, out_q);
+typedef struct { scheduler_t *s; int *ids; size_t count; } rm_ctx_t;
 
-	size_t num_workers = 20, num_tasks = 10;
-	scheduler_t *sched = scheduler_init(num_workers, num_tasks, out_q); // 20 workers, 10 tasks 
-	if (!sched) 
-		return -1;
-
-	uint64_t ms = 1000000ULL;
-
-	user_task_t tasks[] = {
-		{ .task_fn = foo1,  .arg = &param1,  .interval_ns = 500 * ms,  .miss_policy = TASK_MISS_SKIP },
-		{ .task_fn = foo2,  .arg = &param2,  .interval_ns = 500 * ms,  .miss_policy = TASK_MISS_SKIP },
-		{ .task_fn = foo3,  .arg = &param3,  .interval_ns = 750 * ms,  .miss_policy = TASK_MISS_SKIP },
-		{ .task_fn = foo4,  .arg = &param4,  .interval_ns = 750 * ms,  .miss_policy = TASK_MISS_SKIP },
-		{ .task_fn = foo5,  .arg = &param5,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },
-		{ .task_fn = foo6,  .arg = &param6,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },  
-		{ .task_fn = foo7,  .arg = &param7,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },  
-		{ .task_fn = foo8,  .arg = &param8,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },  
-		{ .task_fn = foo9,  .arg = &param9,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },  
-		{ .task_fn = foo10, .arg = &param10, .interval_ns = 2000 * ms, .miss_policy = TASK_MISS_SKIP }  
-	};	
-	scheduler_add_tasks(sched, tasks, num_tasks);
-
-	scheduler_run(sched);
-
-	async_queue_shutdown(out_q);
-	pthread_join(out_thread, NULL);
-	async_queue_free(out_q);
-
-	return 0;
+void *rm_routine(void *arg) {
+    rm_ctx_t *ctx = (rm_ctx_t *)arg;
+    sleep(2);
+    printf("[rm] removing foo1 id=%d\n", ctx->ids[0]);
+    scheduler_remove_task(ctx->s, ctx->ids[0]);
+    usleep(250 * 1000);
+    printf("[rm] removing foo2 id=%d\n", ctx->ids[1]);
+    scheduler_remove_task(ctx->s, ctx->ids[1]);
+    sleep(1);
+    printf("[rm] removing foo6-slow id=%d\n", ctx->ids[5]);
+    scheduler_remove_task(ctx->s, ctx->ids[5]);
+    printf("[rm] removing foo9-spin id=%d\n", ctx->ids[8]);
+    scheduler_remove_task(ctx->s, ctx->ids[8]);
+    usleep(100 * 1000);
+    printf("[rm] removing foo3 id=%d\n", ctx->ids[2]);
+    scheduler_remove_task(ctx->s, ctx->ids[2]);
+    printf("[rm] removing foo4 id=%d\n", ctx->ids[3]);
+    scheduler_remove_task(ctx->s, ctx->ids[3]);
+    sleep(1);
+    printf("[rm] removing remaining\n");
+    scheduler_remove_task(ctx->s, ctx->ids[4]);
+    scheduler_remove_task(ctx->s, ctx->ids[6]);
+    scheduler_remove_task(ctx->s, ctx->ids[7]);
+    scheduler_remove_task(ctx->s, ctx->ids[9]);
+    printf("[rm] done\n");
+    return NULL;
 }
 
+int main(void) {
+    pthread_t out_thread;
+    async_queue_t *out_q = async_queue_init(100);
+    if (!out_q) return -1;
+    pthread_create(&out_thread, NULL, output_routine, out_q);
 
+    size_t num_workers = 20, num_tasks = 10;
+    scheduler_t *sched = scheduler_init(num_workers, num_tasks, out_q);
+    if (!sched) return -1;
+
+    uint64_t ms = 1000000ULL;
+    user_task_t tasks[] = {
+        { .task_fn = foo1,  .arg = &param1,  .interval_ns = 500  * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo2,  .arg = &param2,  .interval_ns = 500  * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo3,  .arg = &param3,  .interval_ns = 750  * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo4,  .arg = &param4,  .interval_ns = 750  * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo5,  .arg = &param5,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo6,  .arg = &param6,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo7,  .arg = &param7,  .interval_ns = 1000 * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo8,  .arg = &param8,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo9,  .arg = &param9,  .interval_ns = 1500 * ms, .miss_policy = TASK_MISS_SKIP },
+        { .task_fn = foo10, .arg = &param10, .interval_ns = 2000 * ms, .miss_policy = TASK_MISS_SKIP }
+    };
+
+    int *ids = scheduler_add_tasks(sched, tasks, num_tasks);
+    if (!ids) { printf("failed to add tasks\n"); return -1; }
+    for (size_t i = 0; i < num_tasks; i++)
+        printf("task id[%zu] = %d\n", i, ids[i]);
+
+    pthread_t rm_thread;
+    rm_ctx_t rm_ctx = { sched, ids, num_tasks };
+    pthread_create(&rm_thread, NULL, rm_routine, &rm_ctx);
+
+    scheduler_run(sched);
+
+    pthread_join(rm_thread, NULL);
+    free(ids);
+    async_queue_shutdown(out_q);
+    pthread_join(out_thread, NULL);
+    async_queue_free(out_q);
+    return 0;
+}
 
 
 

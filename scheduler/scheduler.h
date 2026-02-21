@@ -5,6 +5,8 @@
 #include "../utils/async_queue.h"
 #include "../utils/worker_pool.h"
 
+#define MAX_TASKS_PER_SCHEDULER 1000
+
 typedef enum {
 	SCHED_ADD = 0,
 	SCHED_ADD_MANY,
@@ -22,6 +24,7 @@ typedef enum {
 
 // user-defined task for scheduler_ctrl_payload_t
 typedef struct {
+	int id;
 	void *(*task_fn)(void*arg);
 	void *arg;
 	uint64_t interval_ns;
@@ -40,6 +43,9 @@ typedef struct {
 			user_task_t *tasks;
 			size_t count;	
 		} add_many;
+		struct {
+			int task_id;
+		} remove;
 
 	};
 } scheduler_ctrl_payload_t;
@@ -53,6 +59,8 @@ typedef enum {
 } task_state_t;
 
 struct task_t {
+	int id;
+
 	void *(*task_fn)(void*arg);
 	void *result;
 	void *arg;
@@ -80,6 +88,10 @@ typedef struct scheduler_t {
 	scheduler_entry_t *heap;
 	size_t size;
 	size_t capacity;
+
+	task_t *task_registry[MAX_TASKS_PER_SCHEDULER];
+	pthread_mutex_t task_id_lock;
+	uint64_t task_id_bitmap[MAX_TASKS_PER_SCHEDULER / 64 + 1];
 
 	int epoll_fd;
 

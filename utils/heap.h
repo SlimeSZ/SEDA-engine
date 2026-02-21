@@ -66,6 +66,22 @@ static inline scheduler_entry_t *heap_peek(scheduler_t *s) {
 	return &s->heap[0];
 }
 
+/* adding for sched remove task functionality */
+static inline int heap_remove(scheduler_t *s, int task_id) {
+	for (size_t i = 0; i < s->size; i++) {
+		if (s->heap[i].task->id != task_id)
+			continue;
+		s->heap[i] = s->heap[s->size - 1];
+		s->size--;
+		if (s->size > 0 && i < s->size) {
+			heapify_up(s, i);
+			heapify_down(s, i);
+		}
+		return 0;
+	}
+	return -1;
+}
+
 static inline int heap_empty(const scheduler_t *s) { return s->size == 0; }
 static inline int heap_full(const scheduler_t *s) { return s->size >= s->capacity; }
 

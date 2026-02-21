@@ -10,7 +10,7 @@ int sched_ctrl_add_many_tasks(
 	user_task_t *tasks,
 	size_t count
 );
-int sched_ctrl_rm_task(scheduler_t *s, task_t *task);
+int sched_ctrl_rm_task(scheduler_t *s, int task_id);
 int sched_ctrl_pause_task(scheduler_t *s, task_t *task);
 int sched_ctrl_resume_task(scheduler_t *s, task_t *task);
 int sched_ctrl_reschedule_task(scheduler_t *s, task_t *task);
